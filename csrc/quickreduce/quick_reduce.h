@@ -22,13 +22,14 @@ template <typename AllReduceKernel, typename T>
 __global__ __quickreduce_launch_bounds_two_shot__ static void
 allreduce_prototype_twoshot(T const* A, T* B, uint32_t N, uint32_t num_blocks,
                             int rank, uint8_t** dbuffer_list,
-                            uint32_t data_offset, uint32_t flag_color) {
+                            uint32_t data_offset, uint32_t flag_color,
+                            int64_t data_size_per_phase) {
   int block = blockIdx.x;
   int grid = gridDim.x;
 
   while (block < num_blocks) {
     AllReduceKernel::run(A, B, N, block, rank, dbuffer_list, data_offset,
-                         flag_color);
+                         flag_color, data_size_per_phase);
     block += grid;
     flag_color++;
   }
@@ -41,28 +42,47 @@ allreduce_prototype_twoshot(T const* A, T* B, uint32_t N, uint32_t num_blocks,
     hipLaunchKernelGGL((allreduce_prototype_twoshot<AllReduceKernel, T>),   \
                        dim3(grid), dim3(kBlockTwoShot), 0, stream, A, B, N, \
                        num_blocks, rank, dbuffer_list, data_offset,         \
-                       flag_color);                                         \
+                       flag_color, this->kMaxProblemSize);                  \
   } else if (world_size == 4) {                                             \
     using LineCodec = __codec<T, 4>;                                        \
     using AllReduceKernel = AllReduceTwoshot<T, LineCodec, cast_bf2half>;   \
     hipLaunchKernelGGL((allreduce_prototype_twoshot<AllReduceKernel, T>),   \
                        dim3(grid), dim3(kBlockTwoShot), 0, stream, A, B, N, \
                        num_blocks, rank, dbuffer_list, data_offset,         \
-                       flag_color);                                         \
+                       flag_color, this->kMaxProblemSize);                  \
   } else if (world_size == 8) {                                             \
     using LineCodec = __codec<T, 8>;                                        \
     using AllReduceKernel = AllReduceTwoshot<T, LineCodec, cast_bf2half>;   \
     hipLaunchKernelGGL((allreduce_prototype_twoshot<AllReduceKernel, T>),   \
                        dim3(grid), dim3(kBlockTwoShot), 0, stream, A, B, N, \
                        num_blocks, rank, dbuffer_list, data_offset,         \
-                       flag_color);                                         \
+                       flag_color, this->kMaxProblemSize);                  \
+  }
+
+// INT3 only retains good performance on TP2 (world_size == 2). On TP4/TP8
+// the 3-bit codec's pack/unpack overhead outweighs the reduced communication
+// volume, so INT3 is restricted to a TP2-only dispatch here.
+#define TWOSHOT_DISPATCH_TP2_ONLY(__codec)                                  \
+  if (world_size == 2) {                                                    \
+    using LineCodec = __codec<T, 2>;                                        \
+    using AllReduceKernel = AllReduceTwoshot<T, LineCodec, cast_bf2half>;   \
+    hipLaunchKernelGGL((allreduce_prototype_twoshot<AllReduceKernel, T>),   \
+                       dim3(grid), dim3(kBlockTwoShot), 0, stream, A, B, N, \
+                       num_blocks, rank, dbuffer_list, data_offset,         \
+                       flag_color, this->kMaxProblemSize);                  \
+  } else {                                                                  \
+    throw std::runtime_error(                                               \
+        "INT3 quick all-reduce is only supported for world_size == 2 "      \
+        "(TP2); use INT4/NONE for larger world sizes.");                    \
   }
 
 enum QuickReduceQuantLevel {
-  F16 = 0,
-  INT8 = 1,
-  INT6 = 2,
-  INT4 = 3,
+  // Keep these ids in sync with Python QuickReduceRegime enum.
+  F16 = 0,   // full-precision fp16/bf16 communication
+  INT8 = 1,  // symmetric int8 + per-block scale
+  INT6 = 2,  // symmetric int6 + per-block scale
+  INT4 = 3,  // symmetric int4 + per-block scale
+  INT3 = 4,  // symmetric int3 + per-block scale (TP2 only)
 };
 
 struct DeviceComms {
@@ -182,6 +202,9 @@ struct DeviceComms {
         break;
       case QuickReduceQuantLevel::INT4:
         TWOSHOT_DISPATCH(CodecQ4)
+        break;
+      case QuickReduceQuantLevel::INT3:
+        TWOSHOT_DISPATCH_TP2_ONLY(CodecQ3)
         break;
       default:
         TWOSHOT_DISPATCH(CodecFP)

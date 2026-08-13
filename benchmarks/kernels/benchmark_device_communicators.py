@@ -7,6 +7,10 @@ Benchmark script for device communicators:
 CustomAllreduce (oneshot, twoshot), PyNcclCommunicator,
 and SymmMemCommunicator (multimem, two-shot).
 
+for NCCL symmetric memory you need to set the environment variables
+NCCL_NVLS_ENABLE=1 NCCL_CUMEM_ENABLE=1 VLLM_USE_NCCL_SYMM_MEM=1, otherwise NCCL does
+not use fast NVLS implementation for all reduce.
+
 Usage:
     torchrun --nproc_per_node=<N> benchmark_device_communicators.py [options]
 
@@ -18,23 +22,32 @@ Example:
 import json
 import os
 import time
+from collections.abc import Callable
 from contextlib import nullcontext
-from typing import Callable, Optional
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
-from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+from vllm.distributed.device_communicators.flashinfer_all_reduce import (
+    FlashInferAllReduce,
+)
+from vllm.distributed.device_communicators.pynccl import (
+    PyNcclCommunicator,
+    register_nccl_symmetric_ops,
+)
+from vllm.distributed.device_communicators.pynccl_allocator import (
+    set_graph_pool_id,
+)
 from vllm.distributed.device_communicators.symm_mem import SymmMemCommunicator
 from vllm.logger import init_logger
-from vllm.utils import FlexibleArgumentParser
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 logger = init_logger(__name__)
 
 # Default sequence lengths to benchmark
-DEFAULT_SEQUENCE_LENGTHS = [128, 512, 1024, 2048, 4096, 8192]
+DEFAULT_SEQUENCE_LENGTHS = [16, 64, 128, 512, 1024, 2048, 4096, 8192]
 
 # Fixed hidden size and dtype for all benchmarks
 HIDDEN_SIZE = 8192
@@ -71,6 +84,7 @@ class CommunicatorBenchmark:
         self.symm_mem_comm = None
         self.symm_mem_comm_multimem = None
         self.symm_mem_comm_two_shot = None
+        self.fi_ar_comm = None
 
         self._init_communicators()
 
@@ -98,6 +112,7 @@ class CommunicatorBenchmark:
             )
             if not self.pynccl_comm.disabled:
                 logger.info("Rank %s: PyNcclCommunicator initialized", self.rank)
+                register_nccl_symmetric_ops(self.pynccl_comm)
             else:
                 logger.info("Rank %s: PyNcclCommunicator disabled", self.rank)
                 self.pynccl_comm = None
@@ -150,6 +165,22 @@ class CommunicatorBenchmark:
             )
             self.symm_mem_comm_two_shot = None
 
+        try:
+            self.fi_ar_comm = FlashInferAllReduce(
+                group=self.cpu_group,
+                device=self.device,
+            )
+            if not self.fi_ar_comm.disabled:
+                logger.info("Rank %s: FlashInferAllReduce initialized", self.rank)
+            else:
+                logger.info("Rank %s: FlashInferAllReduce disabled", self.rank)
+                self.fi_ar_comm = None
+        except Exception as e:
+            logger.warning(
+                "Rank %s: Failed to initialize FlashInferAllReduce: %s", self.rank, e
+            )
+            self.fi_ar_comm = None
+
     def benchmark_allreduce(
         self, sequence_length: int, num_warmup: int, num_trials: int
     ) -> dict[str, float]:
@@ -169,7 +200,8 @@ class CommunicatorBenchmark:
                     lambda t, c=comm: c.custom_all_reduce(t),
                     lambda t, c=comm: c.should_custom_ar(t),
                     comm.capture(),
-                    "1stage",  # env variable value
+                    {"VLLM_CUSTOM_ALLREDUCE_ALGO": "1stage"},
+                    None,  # no destroy function
                 )
             )
             # CustomAllreduce two-shot
@@ -179,7 +211,8 @@ class CommunicatorBenchmark:
                     lambda t, c=comm: c.custom_all_reduce(t),
                     lambda t, c=comm: c.should_custom_ar(t),
                     comm.capture(),
-                    "2stage",  # env variable value
+                    {"VLLM_CUSTOM_ALLREDUCE_ALGO": "2stage"},
+                    None,  # no destroy function
                 )
             )
 
@@ -191,7 +224,18 @@ class CommunicatorBenchmark:
                     lambda t, c=comm: c.all_reduce(t),
                     lambda t: True,  # Always available if initialized
                     nullcontext(),
-                    None,  # no env variable needed
+                    {},  # no env variable needed
+                    None,  # no destroy function
+                )
+            )
+            communicators.append(
+                (
+                    "pynccl-symm",
+                    lambda t: torch.ops.vllm.all_reduce_symmetric_with_copy(t),
+                    lambda t: True,  # Always available if initialized
+                    nullcontext(),
+                    {},  # no env variable needed
+                    None,  # no destroy function
                 )
             )
 
@@ -203,7 +247,8 @@ class CommunicatorBenchmark:
                     lambda t, c=comm: c.all_reduce(t),
                     lambda t, c=comm: c.should_use_symm_mem(t),
                     nullcontext(),
-                    None,  # no env variable needed
+                    {},  # no env variable needed
+                    None,  # no destroy function
                 )
             )
 
@@ -215,41 +260,79 @@ class CommunicatorBenchmark:
                     lambda t, c=comm: c.all_reduce(t),
                     lambda t, c=comm: c.should_use_symm_mem(t),
                     nullcontext(),
-                    None,  # no env variable needed
+                    {},  # no env variable needed
+                    None,  # no destroy function needed
+                )
+            )
+
+        if self.fi_ar_comm is not None:
+            comm = self.fi_ar_comm
+            communicators.append(
+                (
+                    "flashinfer_trtllm",
+                    lambda t, c=comm: c.all_reduce(t),
+                    lambda t, c=comm: c.should_use_fi_ar(t),
+                    nullcontext(),
+                    {"VLLM_FLASHINFER_ALLREDUCE_BACKEND": "trtllm"},
+                    lambda c=comm: c.destroy(),
+                )
+            )
+            communicators.append(
+                (
+                    "flashinfer_mnnvl",
+                    lambda t, c=comm: c.all_reduce(t),
+                    lambda t, c=comm: c.should_use_fi_ar(t),
+                    nullcontext(),
+                    {"VLLM_FLASHINFER_ALLREDUCE_BACKEND": "mnnvl"},
+                    lambda c=comm: c.destroy(),
                 )
             )
 
         # Benchmark each communicator
-        for name, allreduce_fn, should_use_fn, context, env_var in communicators:
-            # Set environment variable if needed
-            if env_var is not None:
-                os.environ["VLLM_CUSTOM_ALLREDUCE_ALGO"] = env_var
-            else:
-                # Clear the environment variable to avoid interference
-                os.environ.pop("VLLM_CUSTOM_ALLREDUCE_ALGO", None)
-
-            latency = self.benchmark_allreduce_single(
-                sequence_length,
-                allreduce_fn,
-                should_use_fn,
-                context,
-                num_warmup,
-                num_trials,
-            )
-            if latency is not None:
-                results[name] = latency
+        for (
+            name,
+            allreduce_fn,
+            should_use_fn,
+            context,
+            env_dict,
+            destroy_fn,
+        ) in communicators:
+            # Save original values and apply new environment variables
+            saved_env = {key: os.environ.get(key) for key in env_dict}
+            for key, value in env_dict.items():
+                os.environ[key] = value
+            try:
+                latency = self.benchmark_allreduce_single(
+                    sequence_length,
+                    allreduce_fn,
+                    should_use_fn,
+                    context,
+                    num_warmup,
+                    num_trials,
+                )
+                if latency is not None:
+                    results[name] = latency
+            finally:
+                if destroy_fn is not None:
+                    destroy_fn()
+                # Restore environment variables to their original state
+                for key, original_value in saved_env.items():
+                    if original_value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = original_value
 
         return results
 
     def benchmark_allreduce_single(
         self,
         sequence_length: int,
-        allreduce_fn: Callable[[torch.Tensor], Optional[torch.Tensor]],
+        allreduce_fn: Callable[[torch.Tensor], torch.Tensor | None],
         should_use_fn: Callable[[torch.Tensor], bool],
         context,
         num_warmup: int,
         num_trials: int,
-    ) -> Optional[float]:
+    ) -> float | None:
         """Benchmark method with CUDA graph optimization."""
         try:
             # Create test tensor (2D: sequence_length x hidden_size)
@@ -259,7 +342,7 @@ class CommunicatorBenchmark:
             if not should_use_fn(tensor):
                 return None
 
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             stream = torch.cuda.Stream()
             with torch.cuda.stream(stream):
                 graph_input = tensor.clone()
@@ -271,21 +354,23 @@ class CommunicatorBenchmark:
                 # Capture the graph using context manager
                 with context:
                     graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph):
+                    graph_pool = torch.cuda.graph_pool_handle()
+                    set_graph_pool_id(graph_pool)
+                    with torch.cuda.graph(graph, pool=graph_pool, stream=stream):
                         for _ in range(CUDA_GRAPH_CAPTURE_CYCLES):
                             allreduce_fn(graph_input)
 
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             for _ in range(num_warmup):
                 graph.replay()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
 
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             start_time = time.perf_counter()
 
             for _ in range(num_trials):
                 graph.replay()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
 
             end_time = time.perf_counter()
 
@@ -410,7 +495,7 @@ def main():
 
     # Set device
     device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
+    torch.accelerator.set_device_index(device)
 
     # Get CPU process group
     cpu_group = dist.new_group(backend="gloo")
