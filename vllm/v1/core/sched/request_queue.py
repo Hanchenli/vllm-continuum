@@ -7,6 +7,7 @@ from collections import deque
 from collections.abc import Iterable, Iterator
 from enum import Enum
 
+from vllm.v1.core.sched.continuum import ContinuumJobRegistry, job_key
 from vllm.v1.request import Request
 
 
@@ -15,6 +16,7 @@ class SchedulingPolicy(Enum):
 
     FCFS = "fcfs"
     PRIORITY = "priority"
+    CONTINUUM = "continuum"
 
 
 class RequestQueue(ABC):
@@ -198,11 +200,100 @@ class PriorityRequestQueue(RequestQueue):
             yield heapq.heappop(heap_copy)
 
 
-def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
+class ContinuumRequestQueue(deque[Request], RequestQueue):
+    """A job-level FCFS queue that prefers jobs holding pinned KV.
+
+    Ordering is by the arrival time of a job's *first* turn, so a long
+    trajectory is not pushed behind newly arrived ones as it progresses.
+    Among queued requests, one whose job currently holds pinned KV is chosen
+    first: that pin exists precisely so this turn can consume it, and serving
+    it promptly also releases the pin sooner.
+    """
+
+    def __init__(self, job_registry: ContinuumJobRegistry) -> None:
+        super().__init__()
+        self.job_registry = job_registry
+
+    def add_request(self, request: Request) -> None:
+        """Add a request to the queue according to continuum policy."""
+        self.append(request)
+
+    def pop_request(self) -> Request:
+        """Pop a request from the queue according to continuum policy."""
+        request = self.peek_request()
+        self.remove(request)
+        return request
+
+    def peek_request(self) -> Request:
+        """Peek at the next request in the queue without removing it."""
+        if not self:
+            raise IndexError("peek from an empty queue")
+
+        best: Request | None = None
+        best_sort_key: tuple[bool, float] | None = None
+        for request in self:
+            # Sorts False < True, so negate "is pinned" to prefer pinned jobs.
+            sort_key = (
+                not self.job_registry.is_pinned(job_key(request)),
+                self.job_registry.first_arrival_time(request),
+            )
+            if best_sort_key is None or sort_key < best_sort_key:
+                best_sort_key = sort_key
+                best = request
+        assert best is not None
+        return best
+
+    def prepend_request(self, request: Request) -> None:
+        """Prepend a request to the front of the queue.
+
+        Note: ordering is by job arrival time, so as with the priority queue
+        there is no distinct "front"; the request simply rejoins the queue.
+        """
+        self.appendleft(request)
+
+    def prepend_requests(self, requests: RequestQueue) -> None:
+        """Prepend all requests from another queue to the front of this
+        queue."""
+        self.extendleft(requests)
+
+    def remove_request(self, request: Request) -> None:
+        """Remove a specific request from the queue."""
+        self.remove(request)
+
+    def remove_requests(self, requests: Iterable[Request]) -> None:
+        """Remove multiple specific requests from the queue."""
+        requests_to_remove = set(requests)
+        filtered_requests = [req for req in self if req not in requests_to_remove]
+        # deque does not support in-place filtering, so we need to clear
+        # and extend
+        self.clear()
+        self.extend(filtered_requests)
+
+    def __bool__(self) -> bool:
+        """Check if queue has any requests."""
+        return len(self) > 0
+
+    def __len__(self) -> int:
+        """Get number of requests in queue."""
+        return super().__len__()
+
+    def __iter__(self) -> Iterator[Request]:
+        """Iterate over the queue in insertion order."""
+        return super().__iter__()
+
+
+def create_request_queue(
+    policy: SchedulingPolicy,
+    job_registry: ContinuumJobRegistry | None = None,
+) -> RequestQueue:
     """Create request queue based on scheduling policy."""
     if policy == SchedulingPolicy.PRIORITY:
         return PriorityRequestQueue()
     elif policy == SchedulingPolicy.FCFS:
         return FCFSRequestQueue()
+    elif policy == SchedulingPolicy.CONTINUUM:
+        if job_registry is None:
+            raise ValueError("The continuum policy requires a job registry.")
+        return ContinuumRequestQueue(job_registry)
     else:
         raise ValueError(f"Unknown scheduling policy: {policy}")

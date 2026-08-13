@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
-SchedulerPolicy = Literal["fcfs", "priority"]
+SchedulerPolicy = Literal["fcfs", "priority", "continuum"]
 
 
 @config
@@ -112,7 +112,30 @@ class SchedulerConfig:
     - "fcfs" means first come first served, i.e. requests are handled in order 
       of arrival.
     - "priority" means requests are handled based on given priority (lower
-      value means earlier handling) and time of arrival deciding any ties)."""
+      value means earlier handling) and time of arrival deciding any ties).
+    - "continuum" means multi-turn agent requests sharing a `job_id` are
+      handled as one job: ordering is job-level FCFS, and a finished turn's
+      KV cache is pinned for a short TTL so the job's next turn reuses it.
+      See `vllm/v1/core/sched/continuum.py`."""
+
+    continuum_pin_duration_s: float = 2.0
+    """How long, in seconds, the "continuum" policy pins a finished turn's KV
+    cache while its job runs a tool. Jobs whose observed tool execution time
+    exceeds this are not pinned, since their KV would expire unused."""
+
+    continuum_tool_call_parser: str = "bash_fence"
+    """How the "continuum" policy infers which tool a turn is about to call,
+    used to key its per-tool execution-time estimate. One of "bash_fence"
+    (a single ```bash fenced command), "hermes" (`<tool_call>{...}`), "json"
+    (a bare object with a `name` field), or "none". Only consulted when the
+    client does not supply `this_func_call` itself, which is always
+    authoritative."""
+
+    continuum_max_pinned_blocks: int | None = None
+    """Upper bound on KV blocks the "continuum" policy may hold pinned at
+    once. None (the default) is unlimited. Setting it makes pinning degrade
+    gracefully under memory pressure: once the budget is reached a finished
+    turn is simply freed as usual instead of being pinned."""
 
     disable_chunked_mm_input: bool = False
     """If set to true and chunked prefill is enabled, we do not want to

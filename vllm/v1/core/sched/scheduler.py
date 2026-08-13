@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -39,6 +40,15 @@ from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.sched.continuum import (
+    ContinuumJobRegistry,
+    ContinuumRecorder,
+    PinnedRequest,
+    PinRegistry,
+    ToolCallEstimator,
+    get_tool_call_parser,
+    job_key,
+)
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -179,10 +189,28 @@ class Scheduler(SchedulerInterface):
             raise ValueError(
                 f"Unknown scheduling policy: {self.scheduler_config.policy}"
             ) from e
+        # Continuum policy state. The job registry is shared with the waiting
+        # queues so the scheduler and its queues agree on job ordering.
+        self.job_registry = ContinuumJobRegistry()
+        self.pinned_requests = PinRegistry(
+            max_pinned_blocks=self.scheduler_config.continuum_max_pinned_blocks
+        )
+        self.tool_call_estimator: ToolCallEstimator | None = None
+        # None = not yet loaded, False = load failed (do not retry).
+        self._continuum_tokenizer: Any = None
+        self.continuum_recorder = ContinuumRecorder(os.getenv("RUN_OUTPUT_DIR"))
+        if self.policy == SchedulingPolicy.CONTINUUM:
+            self.tool_call_estimator = ToolCallEstimator(
+                parser=get_tool_call_parser(
+                    self.scheduler_config.continuum_tool_call_parser
+                ),
+                pin_duration_s=self.scheduler_config.continuum_pin_duration_s,
+            )
+
         # Priority queues for requests.
-        self.waiting = create_request_queue(self.policy)
+        self.waiting = create_request_queue(self.policy, self.job_registry)
         # requests skipped in waiting flow due async deps or constraints.
-        self.skipped_waiting = create_request_queue(self.policy)
+        self.skipped_waiting = create_request_queue(self.policy, self.job_registry)
         self.running: list[Request] = []
 
         # The request IDs that are finished in between the previous and the
@@ -422,8 +450,162 @@ class Scheduler(SchedulerInterface):
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
 
+    ########################################################################
+    # Continuum Policy Methods
+    ########################################################################
+
+    def _try_pin_request(self, request: Request) -> bool:
+        """Hold a finished turn's KV cache for its job's next turn.
+
+        Returns True if the request's blocks were pinned, in which case the
+        caller must not free them. The blocks are detached with
+        `pop_blocks_for_free`, which runs the manager's per-request
+        bookkeeping teardown but leaves the blocks referenced, so they stay
+        out of the free queue and remain prefix-cache hits until released.
+        """
+        assert self.tool_call_estimator is not None
+        if request.is_last_step:
+            # The trajectory is over; nothing will reuse this KV.
+            return False
+
+        pin_duration = self.tool_call_estimator.pin_duration_for(request)
+        if pin_duration <= 0:
+            return False
+
+        num_blocks = sum(
+            len(group)
+            for group in self.kv_cache_manager.get_blocks(request.request_id).blocks
+        )
+        if not self.pinned_requests.has_capacity_for(num_blocks):
+            logger.debug(
+                "Continuum pin budget reached (%d blocks held); freeing %s",
+                self.pinned_requests.num_pinned_blocks,
+                request.request_id,
+            )
+            return False
+
+        blocks = self.kv_cache_manager.pop_blocks_for_free(request)
+        if not blocks:
+            return False
+
+        self.pinned_requests.add(
+            PinnedRequest(
+                request=request,
+                expires_at=time.monotonic() + pin_duration,
+                blocks=blocks,
+            )
+        )
+        self.job_registry.set_pinned(request, True)
+        self.continuum_recorder.request_pinned(request, len(blocks))
+        return True
+
+    def _release_pin(self, entry: PinnedRequest) -> None:
+        """Return a pinned entry's blocks to the pool.
+
+        The entry must already have been removed from `self.pinned_requests`.
+        """
+        request = entry.request
+        # `pop_blocks_for_free` hands back blocks in allocation order. Mirror
+        # `_free_request_blocks`: free tail-first now, or hand the list to
+        # `deferred_frees` in allocation order (the drain reverses it).
+        if not self.defer_block_free or self.sched_step_seq <= self.processed_step_seq:
+            self.kv_cache_manager.block_pool.free_blocks(reversed(entry.blocks))
+        else:
+            self.deferred_frees.append((self.sched_step_seq, entry.blocks))
+        self.job_registry.set_pinned(request, False)
+        self.continuum_recorder.request_unpinned(request)
+        self.requests.pop(request.request_id, None)
+
+    def _release_expired_pins(self) -> None:
+        """Release pins whose TTL has elapsed.
+
+        A job with a queued turn keeps its pin: that turn is what the pin is
+        for, and it is about to consume it.
+        """
+        if not self.pinned_requests:
+            return
+        queued_jobs = {
+            job_key(request)
+            for queue in (self.waiting, self.skipped_waiting)
+            for request in queue
+        }
+        for entry in self.pinned_requests.pop_expired(time.monotonic(), queued_jobs):
+            self._release_pin(entry)
+
+    def _release_pins_for_job(self, job_id: str) -> None:
+        """Release every pin held by a job, e.g. once its next turn arrives."""
+        for entry in self.pinned_requests.pop_for_job(job_id):
+            self._release_pin(entry)
+
+    def _reclaim_one_pin(self) -> bool:
+        """Release a single pin to make room. Returns True if one was freed.
+
+        This is the escape hatch that keeps pinning from starving admission
+        when nothing in the running queue can be preempted.
+        """
+        entry = self.pinned_requests.pop_latest_expiring()
+        if entry is None:
+            return False
+        self._release_pin(entry)
+        return True
+
+    def _continuum_output_text(self, request: Request) -> str | None:
+        """Detokenize a finished turn's output for server-side tool parsing.
+
+        Only reached when the client did not declare `this_func_call` and a
+        parser is configured, so the tokenizer is loaded lazily and a failure
+        to load degrades to "no inferred tool" rather than failing the engine.
+        """
+        if request.this_func_call is not None or not request.output_token_ids:
+            return None
+        if self.scheduler_config.continuum_tool_call_parser == "none":
+            return None
+        if self._continuum_tokenizer is None:
+            model_config = self.vllm_config.model_config
+            try:
+                from vllm.transformers_utils.tokenizer import get_tokenizer
+
+                self._continuum_tokenizer = get_tokenizer(
+                    tokenizer_name=model_config.tokenizer,
+                    tokenizer_mode=model_config.tokenizer_mode,
+                    trust_remote_code=model_config.trust_remote_code,
+                    revision=model_config.tokenizer_revision,
+                )
+            except Exception:
+                logger.exception(
+                    "Continuum could not load a tokenizer; tool calls will "
+                    "only be known when clients supply this_func_call."
+                )
+                self._continuum_tokenizer = False
+        if self._continuum_tokenizer is False:
+            return None
+        try:
+            return self._continuum_tokenizer.decode(
+                request.output_token_ids, skip_special_tokens=True
+            )
+        except Exception:
+            logger.exception(
+                "Continuum failed to detokenize output for request %s",
+                request.request_id,
+            )
+            return None
+
+    def _select_continuum_preemption_victim(self) -> Request | None:
+        """Choose which running request to preempt under the continuum policy.
+
+        Prefers the most recently started job, and avoids preempting a job on
+        its last step (which is closest to releasing its KV for good). Returns
+        None when the running queue is empty.
+        """
+        if not self.running:
+            return None
+        candidates = [r for r in self.running if not r.is_last_step] or self.running
+        return max(candidates, key=self.job_registry.first_arrival_time)
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        if self.policy == SchedulingPolicy.CONTINUUM:
+            self._release_expired_pins()
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -573,11 +755,25 @@ class Scheduler(SchedulerInterface):
 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
-                    if self.policy == SchedulingPolicy.PRIORITY:
-                        preempted_req = max(
-                            self.running,
-                            key=lambda r: (r.priority, r.arrival_time),
-                        )
+                    if self.policy in (
+                        SchedulingPolicy.PRIORITY,
+                        SchedulingPolicy.CONTINUUM,
+                    ):
+                        if self.policy == SchedulingPolicy.PRIORITY:
+                            preempted_req = max(
+                                self.running,
+                                key=lambda r: (r.priority, r.arrival_time),
+                            )
+                        else:
+                            victim = self._select_continuum_preemption_victim()
+                            if victim is None:
+                                # Nothing running to preempt. Release a pin to
+                                # make room and retry, else give up on this
+                                # request for now.
+                                if self._reclaim_one_pin():
+                                    continue
+                                break
+                            preempted_req = victim
                         self.running.remove(preempted_req)
                         if preempted_req in scheduled_running_reqs:
                             preempted_req_id = preempted_req.request_id
@@ -601,6 +797,7 @@ class Scheduler(SchedulerInterface):
                         preempted_req = self.running.pop()
 
                     self._preempt_request(preempted_req, scheduled_timestamp)
+                    self.continuum_recorder.request_preempted(preempted_req)
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
                         # No more request to preempt. Cannot schedule this request.
@@ -664,7 +861,7 @@ class Scheduler(SchedulerInterface):
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
-            step_skipped_waiting = create_request_queue(self.policy)
+            step_skipped_waiting = create_request_queue(self.policy, self.job_registry)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
@@ -948,6 +1145,14 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    if (
+                        self.policy == SchedulingPolicy.CONTINUUM
+                        and not self.running
+                        and self._reclaim_one_pin()
+                    ):
+                        # Pinned KV is the only thing holding the pool. Release
+                        # some and let the next scheduler step retry.
+                        pass
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
@@ -1014,8 +1219,20 @@ class Scheduler(SchedulerInterface):
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
                     )
                 if request.status == RequestStatus.WAITING:
+                    self.continuum_recorder.request_scheduled(
+                        request,
+                        prompt_length=request.num_prompt_tokens,
+                        hit_length=num_computed_tokens,
+                        resumed=False,
+                    )
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
+                    self.continuum_recorder.request_scheduled(
+                        request,
+                        prompt_length=request.num_prompt_tokens,
+                        hit_length=num_computed_tokens,
+                        resumed=True,
+                    )
                     scheduled_resumed_reqs.append(request)
                 else:
                     raise RuntimeError(f"Invalid request status: {request.status}")
@@ -2118,6 +2335,11 @@ class Scheduler(SchedulerInterface):
         return len(self.running), len(self.waiting) + len(self.skipped_waiting)
 
     def add_request(self, request: Request) -> None:
+        if self.policy == SchedulingPolicy.CONTINUUM:
+            # This turn consumes the pin its previous turn left behind. Done
+            # before the duplicate-id lookup below so that a reused request id
+            # releases its own pin rather than looking like a live request.
+            self._release_pins_for_job(job_key(request))
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)
@@ -2134,6 +2356,11 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
+            if self.policy == SchedulingPolicy.CONTINUUM:
+                assert self.tool_call_estimator is not None
+                self.job_registry.request_arrived(request)
+                self.tool_call_estimator.request_arrived(request)
+            self.continuum_recorder.request_arrived(request)
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.connector is not None:
@@ -2209,6 +2436,13 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
 
+        if self.policy == SchedulingPolicy.CONTINUUM:
+            assert self.tool_call_estimator is not None
+            self.tool_call_estimator.request_finished(
+                request, self._continuum_output_text(request)
+            )
+        self.continuum_recorder.request_finished(request)
+
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
@@ -2231,10 +2465,19 @@ class Scheduler(SchedulerInterface):
         if not delay_free_blocks:
             self._free_blocks(request)
 
+        if self.policy == SchedulingPolicy.CONTINUUM:
+            # After block disposal: _free_blocks may have pinned the request,
+            # and the registry must observe the pin before it reaps the job.
+            self.job_registry.request_departed(request)
+
         return kv_xfer_params, ec_xfer_params
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        if self.policy == SchedulingPolicy.CONTINUUM and self._try_pin_request(request):
+            # Blocks are held for the job's next turn; `self.requests` keeps
+            # the entry until the pin is released.
+            return
         self._free_request_blocks(request)
         del self.requests[request.request_id]
 
@@ -2308,7 +2551,10 @@ class Scheduler(SchedulerInterface):
         num_in_queues = (
             len(self.waiting) + len(self.skipped_waiting) + len(self.running)
         )
-        return len(self.requests) > num_in_queues
+        # Continuum keeps finished requests in self.requests while their KV is
+        # pinned; those are not awaiting connector cleanup.
+        num_retained = num_in_queues + len(self.pinned_requests)
+        return len(self.requests) > num_retained
 
     def has_requests(self) -> bool:
         # Override the interface default to also keep the engine alive while a
@@ -2462,6 +2708,7 @@ class Scheduler(SchedulerInterface):
 
     def shutdown(self) -> None:
         logger.debug_once("[shutdown] Scheduler: start")
+        self.continuum_recorder.write()
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:

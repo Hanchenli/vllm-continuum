@@ -56,6 +56,35 @@ class StreamingUpdate:
         )
 
 
+def _opt_str(extra_args: dict[str, Any] | None, key: str) -> str | None:
+    if not extra_args:
+        return None
+    value = extra_args.get(key)
+    return None if value is None else str(value)
+
+
+def _opt_bool(extra_args: dict[str, Any] | None, key: str) -> bool | None:
+    """Read a boolean from `extra_args`.
+
+    `vllm_xargs` values are typed as str/int/float, so a boolean may arrive as
+    a bool, as 0/1, or as a string such as "true".
+    """
+    if not extra_args:
+        return None
+    value = extra_args.get(key)
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("1", "true", "yes", "y"):
+            return True
+        if lowered in ("0", "false", "no", "n"):
+            return False
+    return None
+
+
 class Request:
     def __init__(
         self,
@@ -93,6 +122,17 @@ class Request:
                 reasoning_parser_kwargs
             )
         self.arrival_time = arrival_time if arrival_time is not None else time.time()
+
+        # Continuum scheduling metadata, carried in `SamplingParams.extra_args`
+        # (populated from the OpenAI-compatible `vllm_xargs` request field).
+        # Only the "continuum" scheduling policy reads these; under every other
+        # policy they are inert. `this_func_call` and `last_func_call` may be
+        # filled in later by the scheduler when the client does not supply them.
+        extra_args = sampling_params.extra_args if sampling_params is not None else None
+        self.job_id: str | None = _opt_str(extra_args, "job_id")
+        self.last_func_call: str | None = _opt_str(extra_args, "last_func_call")
+        self.this_func_call: str | None = _opt_str(extra_args, "this_func_call")
+        self.is_last_step: bool | None = _opt_bool(extra_args, "is_last_step")
 
         self.status = RequestStatus.WAITING
         self.events: list[EngineCoreEvent] = []
